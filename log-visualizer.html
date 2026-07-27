@@ -221,7 +221,7 @@
           <div class="empty-inner">
             <div class="empty-mark" aria-hidden="true">↗</div>
             <h2>先添加一组 benchmark 日志</h2>
-            <p>每个集合可一次选择多个 <code>.jsonl</code> 文件，也可选择一个包含多条记录的文件。横轴自动使用 <code>max_concurrency</code> 并按数值升序排列。</p>
+            <p>每个集合可一次选择多个 <code>.jsonl</code> 文件，也可选择一个包含多条记录的文件。页面会根据记录变化自动选择 <code>max_concurrency</code> 或 <code>request_rate</code> 作为横轴。</p>
           </div>
         </div>
         <div id="results" hidden>
@@ -236,7 +236,7 @@
   <script>
     (() => {
       const COLORS = ["#0b766e", "#db6b45", "#5269a8", "#a15687", "#8a7328", "#55766a", "#b44b4b", "#547c9b"];
-      const OMIT_KEYS = new Set(["max_concurrency", "max_concurrent_requests", "concurrency", "random_input_len", "random_output_len"]);
+      const OMIT_KEYS = new Set(["max_concurrency", "max_concurrent_requests", "concurrency", "request_rate", "random_input_len", "random_output_len"]);
       const LABELS = {
         mean_ttft_ms: "Mean TTFT", median_ttft_ms: "Median TTFT", p90_ttft_ms: "P90 TTFT", p95_ttft_ms: "P95 TTFT", p99_ttft_ms: "P99 TTFT",
         mean_tpot_ms: "Mean TPOT", median_tpot_ms: "Median TPOT", p90_tpot_ms: "P90 TPOT", p95_tpot_ms: "P95 TPOT", p99_tpot_ms: "P99 TPOT",
@@ -282,7 +282,7 @@
           const meta = set.error
             ? `<p class="set-meta set-error">${escapeHtml(set.error)}</p>`
             : set.records.length
-              ? `<p class="set-meta">${set.records.length} 条记录 · ${formatLengths(set.records)} · 并发 ${formatConcurrencyRange(set.records)}</p>`
+              ? `<p class="set-meta">${set.records.length} 条记录 · ${formatLengths(set.records)} · ${formatAxisRange(set.records)}</p>`
               : `<p class="set-meta">选择同一 in/out 长度的日志</p>`;
           return `<article class="set-card" style="--series:${COLORS[index % COLORS.length]}">
             <div class="set-top">
@@ -338,9 +338,10 @@
             });
           }
           if (!records.length) throw new Error("没有找到可用的 JSONL 记录");
-          const withoutConcurrency = records.find(record => !Number.isFinite(getConcurrency(record)));
-          if (withoutConcurrency) throw new Error(`${withoutConcurrency.__file} 缺少 max_concurrency`);
-          set.records = records.sort((a, b) => getConcurrency(a) - getConcurrency(b));
+          const withoutAxis = records.find(record => !Number.isFinite(getConcurrency(record)) && !Number.isFinite(getRequestRate(record)));
+          if (withoutAxis) throw new Error(`${withoutAxis.__file} 缺少 max_concurrency 和 request_rate`);
+          const axis = detectXAxis([{ records }]);
+          set.records = records.sort((a, b) => getXAxisValue(a, axis) - getXAxisValue(b, axis));
           set.files = files.map(file => file.name);
           const signatures = new Set(records.map(lengthSignature));
           if (signatures.size > 1) set.error = `in/out 长度不一致：${[...signatures].join("、")}`;
@@ -377,6 +378,37 @@
         return Number(value);
       }
 
+      function getRequestRate(record) {
+        if (record.request_rate === null || record.request_rate === undefined || record.request_rate === "") return NaN;
+        return Number(record.request_rate);
+      }
+
+      function distinctFinite(records, getter) {
+        return new Set(records.map(getter).filter(Number.isFinite));
+      }
+
+      function detectXAxis(sets) {
+        const populated = sets.filter(set => set.records.length);
+        const rateVaries = populated.some(set => distinctFinite(set.records, getRequestRate).size > 1);
+        const concurrencyConstant = populated.every(set => distinctFinite(set.records, getConcurrency).size <= 1);
+        const hasConcurrency = populated.some(set => distinctFinite(set.records, getConcurrency).size > 0);
+        const hasRequestRate = populated.some(set => distinctFinite(set.records, getRequestRate).size > 0);
+        if ((rateVaries && concurrencyConstant) || (!hasConcurrency && hasRequestRate)) return "request_rate";
+        return "max_concurrency";
+      }
+
+      function getXAxisValue(record, axis) {
+        return axis === "request_rate" ? getRequestRate(record) : getConcurrency(record);
+      }
+
+      function axisLabel(axis) {
+        return axis === "request_rate" ? "Request rate" : "最大并发度";
+      }
+
+      function axisUnit(axis) {
+        return axis === "request_rate" ? "req/s" : "";
+      }
+
       function getInputLength(record) {
         return record.random_input_len ?? record.sharegpt_input_len ?? record.input_len ?? record.input_length ?? record.mean_input_len;
       }
@@ -394,10 +426,12 @@
         return signatures.length === 1 ? `in/out ${signatures[0]}` : `${signatures.length} 种 in/out`;
       }
 
-      function formatConcurrencyRange(records) {
-        const values = records.map(getConcurrency).filter(Number.isFinite);
-        if (!values.length) return "—";
-        return values.length === 1 ? formatNumber(values[0]) : `${formatNumber(Math.min(...values))}–${formatNumber(Math.max(...values))}`;
+      function formatAxisRange(records) {
+        const axis = detectXAxis([{ records }]);
+        const values = records.map(record => getXAxisValue(record, axis)).filter(Number.isFinite);
+        if (!values.length) return `${axisLabel(axis)} —`;
+        const range = values.length === 1 ? formatNumber(values[0]) : `${formatNumber(Math.min(...values))}–${formatNumber(Math.max(...values))}`;
+        return `${axisLabel(axis)} ${range}${axisUnit(axis) ? ` ${axisUnit(axis)}` : ""}`;
       }
 
       function collectMetrics() {
@@ -462,20 +496,22 @@
 
         const lengthLabels = [...new Set(validSets.flatMap(set => set.records.map(lengthSignature)))];
         const points = validSets.reduce((sum, set) => sum + set.records.length, 0);
+        const axis = detectXAxis(validSets);
         els.overview.innerHTML = `
           <span class="chip">${validSets.length} 个集合</span>
-          <span class="chip">${points} 个并发点</span>
+          <span class="chip">${points} 个数据点</span>
+          <span class="chip">横轴：${escapeHtml(axisLabel(axis))}</span>
           <span class="chip">in/out ${escapeHtml(lengthLabels.join("、"))}</span>`;
-        els.charts.innerHTML = metrics.map((metric, index) => chartMarkup(metric, validSets, index)).join("");
+        els.charts.innerHTML = metrics.map((metric, index) => chartMarkup(metric, validSets, index, axis)).join("");
         attachChartInteractions();
       }
 
-      function chartMarkup(metric, sets, chartIndex) {
+      function chartMarkup(metric, sets, chartIndex, axis) {
         const width = 900, height = 390;
         const margin = { top: 20, right: 24, bottom: 54, left: 78 };
         const plotW = width - margin.left - margin.right, plotH = height - margin.top - margin.bottom;
         const allPoints = sets.flatMap(set => set.records
-          .map(record => ({ x: getConcurrency(record), y: Number(record[metric]) }))
+          .map(record => ({ x: getXAxisValue(record, axis), y: Number(record[metric]) }))
           .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y)));
         if (!allPoints.length) return "";
         const xValues = allPoints.map(point => point.x);
@@ -505,11 +541,11 @@
         }).join("");
         const series = sets.map((set, setIndex) => {
           const color = COLORS[setIndex % COLORS.length];
-          const points = set.records.map(record => ({ x: getConcurrency(record), y: Number(record[metric]) }))
+          const points = set.records.map(record => ({ x: getXAxisValue(record, axis), y: Number(record[metric]) }))
             .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y)).sort((a,b) => a.x-b.x);
           const path = points.map((point, index) => `${index ? "L" : "M"} ${xScale(point.x).toFixed(2)} ${yScale(point.y).toFixed(2)}`).join(" ");
           const circles = points.map(point => `<circle class="point" tabindex="0" cx="${xScale(point.x).toFixed(2)}" cy="${yScale(point.y).toFixed(2)}" r="5" fill="${color}"
-            data-set="${escapeHtml(set.name)}" data-x="${point.x}" data-y="${point.y}" data-unit="${escapeHtml(unitFor(metric))}" aria-label="${escapeHtml(set.name)}，并发 ${point.x}，${displayLabel(metric)} ${formatNumber(point.y)} ${unitFor(metric)}"></circle>`).join("");
+            data-set="${escapeHtml(set.name)}" data-x="${point.x}" data-x-label="${escapeHtml(axisLabel(axis))}" data-x-unit="${escapeHtml(axisUnit(axis))}" data-y="${point.y}" data-unit="${escapeHtml(unitFor(metric))}" aria-label="${escapeHtml(set.name)}，${axisLabel(axis)} ${point.x}${axisUnit(axis) ? ` ${axisUnit(axis)}` : ""}，${displayLabel(metric)} ${formatNumber(point.y)} ${unitFor(metric)}"></circle>`).join("");
           return `<g clip-path="url(#${clipId})"><path class="series-line" stroke="${color}" d="${path}"></path>${circles}</g>`;
         }).join("");
         const legend = sets.map((set, index) => `<span class="legend-item" style="--series:${COLORS[index % COLORS.length]}"><span class="legend-line"></span>${escapeHtml(set.name)}</span>`).join("");
@@ -518,13 +554,13 @@
           <div class="chart-head"><h3>${escapeHtml(displayLabel(metric))}</h3><span class="chart-unit">${escapeHtml(unitFor(metric) || "value")}</span></div>
           <div class="chart-box">
             <svg viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title-${chartIndex} desc-${chartIndex}">
-              <title id="title-${chartIndex}">${escapeHtml(displayLabel(metric))} 并发度对比</title>
-              <desc id="desc-${chartIndex}">横轴为最大并发度，纵轴为 ${escapeHtml(displayLabel(metric))}，包含 ${sets.length} 个记录集合。</desc>
+              <title id="title-${chartIndex}">${escapeHtml(displayLabel(metric))} ${escapeHtml(axisLabel(axis))} 对比</title>
+              <desc id="desc-${chartIndex}">横轴为 ${escapeHtml(axisLabel(axis))}，纵轴为 ${escapeHtml(displayLabel(metric))}，包含 ${sets.length} 个记录集合。</desc>
               <defs><clipPath id="${clipId}"><rect x="${margin.left-7}" y="${margin.top-7}" width="${plotW+14}" height="${plotH+14}"></rect></clipPath></defs>
               ${grid}
               <line class="axis-line" x1="${margin.left}" y1="${height-margin.bottom}" x2="${width-margin.right}" y2="${height-margin.bottom}"></line>
               ${xAxis}
-              <text class="axis-label" x="${margin.left + plotW/2}" y="${height-10}" text-anchor="middle">最大并发度</text>
+              <text class="axis-label" x="${margin.left + plotW/2}" y="${height-10}" text-anchor="middle">${escapeHtml(axisLabel(axis))}${axisUnit(axis) ? ` (${escapeHtml(axisUnit(axis))})` : ""}</text>
               ${series}
             </svg>
             <div class="tooltip" hidden></div>
@@ -537,7 +573,7 @@
         document.querySelectorAll(".chart-box").forEach(box => {
           const tooltip = box.querySelector(".tooltip");
           const show = point => {
-            tooltip.innerHTML = `<strong>${escapeHtml(point.dataset.set)}</strong>并发 ${formatNumber(Number(point.dataset.x))}<br>${formatNumber(Number(point.dataset.y))}${point.dataset.unit ? ` ${escapeHtml(point.dataset.unit)}` : ""}`;
+            tooltip.innerHTML = `<strong>${escapeHtml(point.dataset.set)}</strong>${escapeHtml(point.dataset.xLabel)} ${formatNumber(Number(point.dataset.x))}${point.dataset.xUnit ? ` ${escapeHtml(point.dataset.xUnit)}` : ""}<br>${formatNumber(Number(point.dataset.y))}${point.dataset.unit ? ` ${escapeHtml(point.dataset.unit)}` : ""}`;
             tooltip.hidden = false;
             const boxRect = box.getBoundingClientRect();
             const pointRect = point.getBoundingClientRect();
