@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SGLang Benchmark 对比</title>
+  <title>LLM Benchmark Visualizer</title>
   <style>
     :root {
       color-scheme: light;
@@ -184,7 +184,7 @@
     <header class="masthead">
       <div>
         <p class="eyebrow">Local benchmark studio</p>
-        <h1>SGLang 性能曲线，一眼看清。</h1>
+        <h1>LLM 推理性能曲线，一眼看清。</h1>
       </div>
       <p class="intro">把同一输入/输出长度、不同并发度的 JSONL 日志归入一个集合。选择指标后，每张图会叠加所有集合的曲线；文件仅在浏览器本地解析。</p>
     </header>
@@ -221,7 +221,7 @@
           <div class="empty-inner">
             <div class="empty-mark" aria-hidden="true">↗</div>
             <h2>先添加一组 benchmark 日志</h2>
-            <p>每个集合可一次选择多个 <code>.jsonl</code> 文件，也可选择一个包含多条记录的文件。页面会根据记录变化自动选择 <code>max_concurrency</code> 或 <code>request_rate</code> 作为横轴。</p>
+            <p>支持 SGLang <code>.jsonl</code> 与 vLLM <code>.json</code> 结果。每个集合需使用同一后端；页面会根据记录变化自动选择 <code>max_concurrency</code> 或 <code>request_rate</code> 作为横轴。</p>
           </div>
         </div>
         <div id="results" hidden>
@@ -282,8 +282,8 @@
           const meta = set.error
             ? `<p class="set-meta set-error">${escapeHtml(set.error)}</p>`
             : set.records.length
-              ? `<p class="set-meta">${set.records.length} 条记录 · ${formatLengths(set.records)} · ${formatAxisRange(set.records)}</p>`
-              : `<p class="set-meta">选择同一 in/out 长度的日志</p>`;
+              ? `<p class="set-meta">${backendLabel(set.records[0].__backend)} · ${set.records.length} 条记录 · ${formatLengths(set.records)} · ${formatAxisRange(set.records)}</p>`
+              : `<p class="set-meta">选择同一后端、同一 in/out 长度的日志</p>`;
           return `<article class="set-card" style="--series:${COLORS[index % COLORS.length]}">
             <div class="set-top">
               <span class="swatch" aria-hidden="true"></span>
@@ -291,7 +291,7 @@
               <button class="icon-button" data-remove="${set.id}" type="button" aria-label="删除${escapeHtml(set.name)}">×</button>
             </div>
             <div class="source-buttons">
-              <label class="file-button">选择 JSONL 文件
+              <label class="file-button">选择 JSON / JSONL
                 <input type="file" data-files="${set.id}" accept=".jsonl,.json,application/json" multiple>
               </label>
               <label class="file-button">选择文件夹
@@ -311,10 +311,10 @@
         els.sets.querySelectorAll("[data-files]").forEach(input => input.addEventListener("change", event => loadFiles(input.dataset.files, [...event.target.files])));
         els.sets.querySelectorAll("[data-folder]").forEach(input => input.addEventListener("change", event => {
           const allFiles = [...event.target.files];
-          const jsonlFiles = allFiles.filter(file => file.name.toLowerCase().endsWith(".jsonl"));
+          const benchmarkFiles = allFiles.filter(file => /\.(jsonl|json)$/i.test(file.name));
           const relativePath = allFiles.find(file => file.webkitRelativePath)?.webkitRelativePath || "";
           const folderName = relativePath.split("/").filter(Boolean)[0] || "";
-          loadFiles(input.dataset.folder, jsonlFiles, { folderName });
+          loadFiles(input.dataset.folder, benchmarkFiles, { folderName });
         }));
       }
 
@@ -324,20 +324,15 @@
         set.error = "";
         if (options.folderName) set.name = options.folderName;
         try {
-          if (!files.length) throw new Error(options.folderName ? "该文件夹中没有找到 .jsonl 文件" : "没有选择文件");
+          if (!files.length) throw new Error(options.folderName ? "该文件夹中没有找到 .json 或 .jsonl 文件" : "没有选择文件");
           const records = [];
           for (const file of files) {
-            const text = await file.text();
-            const lines = text.split(/\r?\n/).filter(line => line.trim());
-            lines.forEach((line, lineIndex) => {
-              try {
-                records.push({ ...JSON.parse(normalizeNonFinite(line)), __file: file.name, __line: lineIndex + 1 });
-              } catch (error) {
-                throw new Error(`${file.name} 第 ${lineIndex + 1} 行无法解析`);
-              }
-            });
+            records.push(...await parseBenchmarkFile(file));
           }
-          if (!records.length) throw new Error("没有找到可用的 JSONL 记录");
+          if (!records.length) throw new Error("没有找到可用的 benchmark 记录");
+          const backends = new Set(records.map(record => record.__backend));
+          if (backends.has("unknown")) throw new Error("无法识别部分记录的后端，请确认 backend 为 vllm 或 sglang");
+          if (backends.size > 1) throw new Error(`集合内后端不一致：${[...backends].map(backendLabel).join("、")}`);
           const withoutAxis = records.find(record => !Number.isFinite(getConcurrency(record)) && !Number.isFinite(getRequestRate(record)));
           if (withoutAxis) throw new Error(`${withoutAxis.__file} 缺少 max_concurrency 和 request_rate`);
           const axis = detectXAxis([{ records }]);
@@ -351,6 +346,66 @@
           set.error = error.message || "文件解析失败";
         }
         refresh();
+      }
+
+      async function parseBenchmarkFile(file) {
+        const text = await file.text();
+        if (!text.trim()) return [];
+        if (file.name.toLowerCase().endsWith(".json")) {
+          try {
+            const parsed = JSON.parse(normalizeNonFinite(text));
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            return items.map((record, index) => {
+              if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("记录不是 JSON 对象");
+              return { ...normalizeRecord(record), __file: file.name, __line: index + 1 };
+            });
+          } catch (error) {
+            throw new Error(`${file.name} 无法解析：${error.message}`);
+          }
+        }
+
+        return text.split(/\r?\n/).filter(line => line.trim()).map((line, lineIndex) => {
+          try {
+            const record = JSON.parse(normalizeNonFinite(line));
+            if (!record || typeof record !== "object" || Array.isArray(record)) throw new Error("记录不是 JSON 对象");
+            return { ...normalizeRecord(record), __file: file.name, __line: lineIndex + 1 };
+          } catch (error) {
+            throw new Error(`${file.name} 第 ${lineIndex + 1} 行无法解析`);
+          }
+        });
+      }
+
+      function detectBackend(record) {
+        const declared = String(record.backend ?? record.endpoint_type ?? "").toLowerCase();
+        if (declared.includes("vllm")) return "vllm";
+        if (declared.includes("sglang")) return "sglang";
+        if (record.server_info) return "sglang";
+        if (Object.keys(record).some(key => key.endsWith("_e2el_ms"))) return "vllm";
+        return "unknown";
+      }
+
+      function backendLabel(backend) {
+        if (backend === "vllm") return "vLLM";
+        if (backend === "sglang") return "SGLang";
+        return "未知后端";
+      }
+
+      function normalizeRecord(record) {
+        const normalized = { ...record, __backend: detectBackend(record) };
+        ["mean", "median", "std", "p90", "p95", "p99"].forEach(prefix => {
+          const source = `${prefix}_e2el_ms`;
+          const target = `${prefix}_e2e_latency_ms`;
+          if (normalized[target] == null && normalized[source] != null) normalized[target] = normalized[source];
+          delete normalized[source];
+        });
+        if (normalized.total_throughput == null && normalized.total_token_throughput != null) {
+          normalized.total_throughput = normalized.total_token_throughput;
+        }
+        delete normalized.total_token_throughput;
+        if (normalized.input_throughput == null && Number(normalized.duration) > 0 && Number.isFinite(Number(normalized.total_input_tokens))) {
+          normalized.input_throughput = Number(normalized.total_input_tokens) / Number(normalized.duration);
+        }
+        return normalized;
       }
 
       function normalizeNonFinite(text) {
@@ -410,11 +465,19 @@
       }
 
       function getInputLength(record) {
-        return record.random_input_len ?? record.sharegpt_input_len ?? record.input_len ?? record.input_length ?? record.mean_input_len;
+        const direct = record.random_input_len ?? record.sharegpt_input_len ?? record.input_len ?? record.input_length ?? record.mean_input_len;
+        if (direct != null) return direct;
+        const completed = Number(record.completed ?? record.num_prompts);
+        const total = Number(record.total_input_tokens);
+        return completed > 0 && Number.isFinite(total) ? total / completed : undefined;
       }
 
       function getOutputLength(record) {
-        return record.random_output_len ?? record.sharegpt_output_len ?? record.output_len ?? record.output_length ?? record.mean_output_len;
+        const direct = record.random_output_len ?? record.sharegpt_output_len ?? record.output_len ?? record.output_length ?? record.mean_output_len;
+        if (direct != null) return direct;
+        const completed = Number(record.completed ?? record.num_prompts);
+        const total = Number(record.total_output_tokens);
+        return completed > 0 && Number.isFinite(total) ? total / completed : undefined;
       }
 
       function lengthSignature(record) {
